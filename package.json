@@ -1,0 +1,15 @@
+{
+  "name": "fedlearn-connection-layer",
+  "version": "1.0.0",
+  "description": "Connection layer for federated learning — Host, Worker, Relay",
+  "private": true,
+  "scripts": {
+    "host": "node host/server.js",
+    "relay": "node relay/relay.js",
+    "worker": "node worker/client.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0",
+    "uuid": "^11.1.0"
+  }
+}
