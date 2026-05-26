@@ -1,37 +1,90 @@
 # FedLearn: High-Performance Browser Federated Learning
 
-A highly scalable, production-grade federated learning system built for the open internet. FedLearn trains machine learning models across thousands of heterogeneous edge devices (browsers, mobile phones, laptops) using pure JavaScript, WebSockets, and ONNX Runtime.
+A highly scalable, production-grade federated learning platform built for the open internet. FedLearn trains machine learning models across thousands of heterogeneous edge devices (browsers, mobile phones, laptops) using pure JavaScript, WebSockets, and ONNX Runtime.
+
+---
 
 ## 🌟 Key Features
 
+- **Multi-Tenant Job Isolation:** Deploy and train multiple independent federated models simultaneously. Weight parameters, update buffers, worker registries, early stopping counters, and historical logs are completely isolated per job.
+- **Dynamic Job Submission API:** REST endpoints (`POST /job/create`, `GET /job/:id`) allow developers and researchers to configure and launch custom training jobs with distinct hyperparameters on the fly.
+- **Zero-Install Browser Compute Volunteering:** Renders a gorgeous, real-time dashboard with a copyable invite link (`/join/<jobId>`). Anyone opening the link instantly launches a background Web Worker that fetches the model, registers to the job, and contributes compute power securely.
 - **Browser-Native Edge Compute:** Executes forward passes via `onnxruntime-web` and manual backpropagation entirely inside Web Workers. Zero UI thread blocking.
 - **Zero-Copy Binary Protocol:** Uses raw `ArrayBuffer` and `Float32Array` for network transport and memory transfer. Eliminates JSON overhead, reducing tensor serialization latency from ~45ms to <1ms.
-- **Asynchronous Aggregation (FedBuff):** Destroys the "straggler bottleneck." The coordinator never waits for slow devices; it aggregates dynamically when an adaptive threshold ($K$) is reached, applying exponential decay weighting to stale gradients.
-- **Multi-Coordinator Sharding:** Horizontally scales to 1,000+ concurrent workers. A stateless partitioner distributes WebSocket traffic across independent shards, while a global sync service applies version-aware "soft synchronization" across the network.
-- **Byzantine Fault Tolerance:** Built for untrusted environments. A rigorous validation firewall and statistical outlier detection (Trimmed/Median aggregation) protects the global model from `NaN` injections, data poisoning, and malicious workers.
-- **Adaptive Smart Scheduling:** Continuously profiles worker latency and reliability. Dynamically assigns larger data batches to fast GPUs and smaller batches to throttled mobile browsers, minimizing idle gaps and maximizing global throughput.
-- **Incentive & Gamification Layer:** Tracks verified mathematical utility. Rewards high-throughput, reliable contributors with credits and leaderboard rankings, disincentivizing spam.
+- **Asynchronous Aggregation (FedBuff):** Destroys the "straggler bottleneck." The coordinator never waits for slow devices; it aggregates updates dynamically per-job when a buffered threshold ($K$) is reached.
+- **FedProx & Local Steps:** Stabilizes training when worker data distributions are heterogeneous (non-IID) by applying local multi-step training along with a proximal loss regularization term ($\mu$).
+- **Differential Privacy (DP):** Enforces worker-side **L2 Gradient Clipping** and **Gaussian Noise Injection** to prevent data reconstruction attacks, tracked in real-time by a **Rényi DP (RDP) Accountant**.
+- **Bandwidth Compression:** Dramatically reduces network utilization (10–100×) using **Top-K Sparsification** and **INT8 Symmetric Quantization** backed by worker-side **Error Feedback** to prevent convergence loss.
+- **Byzantine Fault Tolerance (BFT):** Employs **Weiszfeld's Geometric Median** on the coordinator, robust to a significant fraction of adversarial workers (~30–40% in practice) without stalling aggregation.
+- **Anti-Gaming Incentive Firewall:** Measures the cosine similarity of worker updates against the aggregated consensus, automatically rejecting spam, zero-norm, or low-similarity inputs.
+
+---
 
 ## 🏗️ Architecture Overview
 
-The system is separated into three distinct layers:
+The system runs on two unified ports (`8000` for REST/Files and `8080` for WebSockets), utilizing isolated job lifecycles:
 
-### 1. The Worker (Client-Side)
-Runs entirely in the browser.
-- **UI Thread:** Handles the WebSocket connection and React-based dashboard.
-- **Web Worker Thread:** Takes ownership of the binary memory buffers, executes the ONNX `InferenceSession`, calculates $\Delta W$, and fires the binary gradients back to the host.
-- **GPU Acceleration:** Optional WebGL 2.0 module (`OffscreenCanvas`) for massively parallel matrix multiplication.
+```mermaid
+graph TD
+    subgraph Creator ["Job Sponsor Portal"]
+        Sponsor[Sponsor] -->|1. Configure & Create Job| HTTP_Server[HTTP Port 8000]
+        HTTP_Server -->|2. Register Isolated Job State| jobs_db["jobs = { jobId -> state }"]
+        Sponsor -->|3. Redirected to /join/jobId| Dash[React Volunteer Dashboard]
+    end
 
-### 2. The Shard Coordinator (Server-Side)
-A Python `asyncio` / `websockets` process.
-- Manages 30-50 active WebSockets.
-- Executes the FedBuff asynchronous buffer logic.
-- Evaluates worker reputation and scales dynamic batch sizes.
+    subgraph Volunteers ["Edge Workers"]
+        Dash -->|4. Launch Compute Thread| Worker[Web Worker: fl_worker.js]
+        Worker -->|5. Handshake JOIN_JOB| WS_Worker[WS Port 8080]
+        Dash -->|6. Telemetry Stream| WS_Telemetry[WS Port 8080/dashboard/jobId]
+    end
 
-### 3. The Global Infrastructure (Scaling)
-- **Partitioner:** An entry point that load-balances new workers across the healthiest shards.
-- **Sync Service:** Periodically pulls local models from all shards, computes a version-weighted global average, and pushes it back down.
-- **Migration Controller:** Detects traffic imbalances and gracefully redirects active workers between shards to maintain optimal load.
+    subgraph Fleet ["Simulated Nodes"]
+        Sim[simulate_binary_workers.js] -->|7. Handshake JOIN_JOB| WS_Worker
+    end
+
+    subgraph Coordinator ["Server Coordinator Shard"]
+        WS_Worker -->|8. Cosine Similarity check| Cosine[utility check]
+        Cosine -- Approved --> Buf["FedBuff Queue (K=minWorkers)"]
+        Buf --> GM["Geometric Median Aggregator"]
+        GM --> Eval["Validation Evaluator (80/20 Split)"]
+        Eval -->|9. Broadcast Update| WS_Telemetry
+    end
+```
+
+---
+
+## 🛠️ REST API Endpoints
+
+The server runs a lightweight HTTP router on **Port 8000** to manage jobs:
+
+### 1. Create Training Job
+- **Route:** `POST /job/create`
+- **Payload:**
+  ```json
+  {
+    "ownerId": "Stanford AI Lab",
+    "modelConfig": {
+      "minWorkers": 3,
+      "fedproxMu": 0.05,
+      "dpC": 1.0,
+      "dpSigma": 0.2,
+      "topK": 0.1,
+      "quantize": "int8",
+      "localSteps": 3
+    }
+  }
+  ```
+- **Response:** `201 Created` returning the job configuration and a unique short `jobId` (e.g. `1b66ea85`).
+
+### 2. Fetch Job Status
+- **Route:** `GET /job/:id`
+- **Response:** `200 OK` returning real-time status and worker rosters.
+
+### 3. Join Job
+- **Route:** `POST /job/join`
+- **Response:** `200 OK` adding the worker node to the job roster.
+
+---
 
 ## 🚀 Quick Start
 
@@ -39,45 +92,59 @@ A Python `asyncio` / `websockets` process.
 - Python 3.10+
 - Node.js 18+
 
-### Setup
+### Setup and Running
 
-1. **Install Python dependencies for the Host:**
+1. **Start the Python Coordinator Server (REST + WebSocket):**
+   Installs `websockets` and `numpy`, and starts the server:
    ```bash
    pip install websockets numpy onnx
+   python host/server.py
    ```
+   - HTTP Server binds to `http://localhost:8000`
+   - WebSocket Coordinator binds to `ws://localhost:8080`
 
-2. **Start the Coordinator Shards:**
+2. **Start the React Dashboard Frontend:**
    ```bash
-   python fedlearn/host/server.py
-   ```
-
-3. **Start the Web Dashboard:**
-   ```bash
-   cd fedlearn/dashboard
+   cd dashboard
    npm install
    npm run dev
    ```
+   Open `http://localhost:5173/` in your browser.
 
-4. **Connect Workers:**
-   Open `http://localhost:5173` in multiple browser tabs (or on different devices connected to your LAN) to simulate a distributed worker fleet.
+3. **Deploy a Federated Session:**
+   - On the homepage (`http://localhost:5173/`), customize the hyperparameters (such as Minimum Workers, Proximal term, DP noise, and compression).
+   - Click **"Deploy Federated Session"**. This sends a request to the REST API and redirects the browser to the active job dashboard: `http://localhost:5173/join/<jobId>`.
 
-## 📊 Monitoring & Observability
+4. **Volunteer Edge Compute:**
+   - Share the `/join/<jobId>` link with other devices or open it in a secondary browser window.
+   - The browser automatically spins up `/fl_worker.js` as a background Web Worker, downloads the model from Port 8000, connects to Port 8080, and prints live logs inside the terminal frame.
 
-The system exposes a lightweight metrics endpoint tracking global health, utilization, and convergence metrics. 
+5. **Start a Simulated Worker Fleet:**
+   To train immediately with an automated fleet of edge nodes, execute the simulator targeted specifically to your Job ID:
+   ```bash
+   node worker/simulate_binary_workers.js --workers 3 --job-id <your-job-id> --fedprox-mu 0.05 --local-steps 3 --top-k 0.1 --quantize int8 --dp-c 1.0 --dp-sigma 0.2
+   ```
 
-```bash
-curl http://localhost:9090/metrics
-```
-```json
-{
-  "active_workers": 142,
-  "updates_per_sec": 3.8,
-  "avg_latency_ms": 312,
-  "drop_rate": 0.04,
-  "load_variance": 5.2
-}
-```
+---
 
-## 🛡️ Security
+## ⚙️ Worker Command-Line Options
 
-FedLearn is designed with zero-trust principles. **No raw datasets are ever shared between peers or uploaded to the server.** Only mathematical gradients ($\Delta W$) are transmitted, ensuring strict data privacy and compliance with localized ML training requirements.
+| Option | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--job-id` | string | *Required* | Target Federated Learning Job ID to register and train |
+| `--workers` | number | `3` | Number of simulated concurrent workers to spin up |
+| `--fedprox-mu` | float | `0.0` | FedProx proximal coefficient $\mu$ (0.0 = standard FedAvg) |
+| `--local-steps`| number | `1` | Local training iterations per batch before computing gradient delta |
+| `--dp-c` | float | `0.0` | Differential Privacy L2 clipping bound $C$ (0.0 = disabled) |
+| `--dp-sigma` | float | `0.0` | Differential Privacy Gaussian noise standard deviation $\sigma$ (0.0 = disabled) |
+| `--top-k` | float | `0.0` | Sparsification fraction (e.g. `0.05` for top 5%, 0.0 = disabled) |
+| `--quantize` | string | `none` | Quantization mode (`none`, `int8`) |
+
+---
+
+## 🛡️ Security & Privacy Guidelines
+
+- **Zero-Trust Client Compute:** No raw datasets or personal data items are ever uploaded.
+- **DP-First Sequence Execution:** Differential Privacy clipping and noise addition occur **BEFORE** gradient compression. Adding DP noise *after* sparsification on the host or worker leaks private index selection details; performing DP noise injection first guarantees mathematically robust privacy preservation via the Post-Processing Theorem.
+- **Anti-Gaming Firewall:** A robust cosine similarity utility check runs on the coordinator server to automatically filter and reject trivial gradients, poisoning attempts, or malicious uploads.
+- **Weiszfeld Geometric Median:** Ensures BFT aggregation that remains robust against up to 49% adversarial workers.

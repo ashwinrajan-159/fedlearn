@@ -20,6 +20,7 @@ const MIN_DELAY_MS = parseInt(flag("min-delay", "150"), 10);
 const MAX_DELAY_MS = parseInt(flag("max-delay", "500"), 10);
 const FAULT_RATE   = parseFloat(flag("fault-rate", "0"));     // 0–1, chance a worker drops a response
 const POISON_RATE  = parseFloat(flag("poison-rate", "0"));    // 0–1, chance of sending malicious grads
+const JOB_ID       = flag("job-id", null);
 
 // --- Differential Privacy ---
 const DP_CLIP_C    = parseFloat(flag("dp-c", "0"));           // L2 clipping bound C (0 = disabled)
@@ -203,7 +204,7 @@ function topKSparsify(grad, fraction) {
   }
   indexed.sort((a, b) => b.absVal - a.absVal);
 
-  const topIndices = new Uint16Array(k);
+  const topIndices = new Uint32Array(k);
   const topValues = new Float32Array(k);
   for (let i = 0; i < k; i++) {
     topIndices[i] = indexed[i].idx;
@@ -276,16 +277,16 @@ function compressWithErrorFeedback(grad, errorBuf, topKFrac, quantMode) {
       errorBuf[i] = corrected[i] - reconstructed[i];
     }
 
-    // Pack: [mode(4)] [nnz(4)] [scale(4)] [indices(2*k)] [qvals(k)]
-    const totalBytes = 4 + 4 + 4 + 2 * k + k;
+    // Pack: [mode(4)] [nnz(4)] [scale(4)] [indices(4*k)] [qvals(k)]
+    const totalBytes = 4 + 4 + 4 + 4 * k + k;
     packedBuffer = Buffer.alloc(totalBytes);
     packedBuffer.writeUInt32LE(COMPRESS_TOPK_INT8, 0);
     packedBuffer.writeUInt32LE(k, 4);
     packedBuffer.writeFloatLE(scale, 8);
     let offset = 12;
     for (let i = 0; i < k; i++) {
-      packedBuffer.writeUInt16LE(indices[i], offset);
-      offset += 2;
+      packedBuffer.writeUInt32LE(indices[i], offset);
+      offset += 4;
     }
     for (let i = 0; i < k; i++) {
       packedBuffer.writeInt8(quantized[i], offset);
@@ -304,15 +305,15 @@ function compressWithErrorFeedback(grad, errorBuf, topKFrac, quantMode) {
       errorBuf[i] = corrected[i] - reconstructed[i];
     }
 
-    // Pack: [mode(4)] [nnz(4)] [indices(2*k)] [values(4*k)]
-    const totalBytes = 4 + 4 + 2 * k + 4 * k;
+    // Pack: [mode(4)] [nnz(4)] [indices(4*k)] [values(4*k)]
+    const totalBytes = 4 + 4 + 4 * k + 4 * k;
     packedBuffer = Buffer.alloc(totalBytes);
     packedBuffer.writeUInt32LE(COMPRESS_TOPK, 0);
     packedBuffer.writeUInt32LE(k, 4);
     let offset = 8;
     for (let i = 0; i < k; i++) {
-      packedBuffer.writeUInt16LE(indices[i], offset);
-      offset += 2;
+      packedBuffer.writeUInt32LE(indices[i], offset);
+      offset += 4;
     }
     for (let i = 0; i < k; i++) {
       packedBuffer.writeFloatLE(values[i], offset);
@@ -423,6 +424,13 @@ class SimulatedWorker {
       this.stats.connected = true;
       this._backoff = 1000; // reset backoff
       this.log(`${C.green}Connected${C.reset}`);
+      if (JOB_ID) {
+        this.ws.send(JSON.stringify({
+          type: "JOIN_JOB",
+          jobId: JOB_ID,
+          workerName: this.name
+        }));
+      }
     });
 
     this.ws.on("message", (data) => {
